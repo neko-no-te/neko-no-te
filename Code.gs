@@ -12,26 +12,31 @@
  *   JOINED・COUNTS・QUEUE・DONE・NOTES・CAPS  参加した人（変換した値）・1日の件数・しまう前の写真・しまった写真の番号・
  *                                           受付の記録に書く前の件数・表に書く前の一言（プログラムが使う）
  *   MADA_ON・SENDERS  3個め（日報まだ番・Mada.gs）を入れたときだけ: その印と、現場ごとに最後に日報か写真を送った人の LINE の番号
- *                     （催促を送るため、変換せずに持つ。表には書かない。3個めを入れていなければ、番号はそのまま残さない）
+ *                     （催促を送るため、変換せずに持つ。表には書かない。印があっても Mada.gs が無ければ、番号はそのまま残さない）
  *   HOGUSHI_ON・HOGUSHI_PENDING・HOGUSHI_MARKED・GEMINI_API_KEY  4個め（日報ほぐし機・Hogushi.gs）を入れたときだけ: その印・読ませる日報がある印・
  *                     入れる前の日報に印を付け終えた印・AI の鍵（使う人が貼る）
  *   TEGAKI_ON・TEGAKI_QUEUE  6個め（手書きすいこみ口・Tegaki.gs）を入れたときだけ: その印と、AI に読ませる手書きの写真（受付番号とドライブの番号）
  *   WAKE_AT  片付けの自動実行を置いた時刻（プログラムが使う）
+ *   SETTINGS_ID  2個め（Yugata.gs）からあと: 保護をかけた「設定」のシートの番号（setupYugata などが入れる）
  *
- * LINEは2秒以内に応えないと「時間切れ」と記録する。写真は取り出してしまうのに6秒ほどかかった（11/19 測定）ので、
+ * LINEは2秒以内に応えないと「時間切れ」と記録する。写真は取り出してしまうのに6秒ほどかかる（見本で測った値）ので、
  * 受け取ったときは番号だけ控えてすぐ返事し、取り出してフォルダと表にしまうのは drainPhotos（片付け）。
  * 受付の記録も、受け取るたびには表に書かず、件数を数えておいて drainPhotos でまとめて書く。日報（文）だけは、すぐ表に入れる。
  * 片付けは、何か届いたときに受け取りが「1分後に1回だけ動く自動実行」を置いて起こす（置いてあるあいだは置き足さない）。
- * 毎分は動かさない（2026-11-22 本人の決定: 本物で、何も無い回も1回1.1秒かかり、無料のアカウントの自動実行の1日90分のうち27分を使っていた）。
+ * 毎分は動かさない（見本で測ると、何も無い回も1回1秒ほどかかり、毎分では、無料のアカウントの自動実行の1日90分のうち27分ほどを使うため）。
+ * 写真が多い回は、片付けの始まりから3分で区切り、残りは次の回にしまう（1回6分の上限で止まって、取り出した写真を失わないように）。
+ * 片付けが取り出した写真は、しまい終わるまで控え（QUEUE）に残し、取り出した印（g）を付ける。印のある写真も受け付けの40枚に数え、
+ * 片付けが途中で止まったときは、印が7分より古くなってから、次の片付けがもう一度扱う（表とドライブに入れ終えた写真は、2つ作らない）。
  *
  * 段1（写真台帳）: 写真をしまうとき、現場ごとの「台帳_現場1」に、印刷用の台帳の形（写真の横に 工事名・送信日時・内容・元の写真）で
  * 枠を1つ足す。貼るのはLINEの小さい版（表に貼れるのは1枚2MBまで）。写真のあと5分以内の最初の文を「一言」として、台帳の内容と、
  * 日報のシートの写真の行に入れる。
  *
- * 表の形（2026-11-21）: データは「日報」1枚（全部の現場・現場は列）と「現場」の一覧（現場・工事名）。現場ごとに分けるのは、
+ * 表の形: データは「日報」1枚（全部の現場・現場は列）と「現場」の一覧（現場・工事名）。現場ごとに分けるのは、
  * 工事ごとに印刷して出す写真台帳だけ。LINEのボタンの現場の名前は、届くたびに表を読まないよう、このプログラムの SITES に持つ。
  *
- * GASは届いた知らせの署名を読めないので、住所の合言葉・宛先・参加の合言葉の3つで守る。
+ * GASは届いた知らせの署名を読めないので、住所の合言葉・宛先・参加の合言葉の3つで守る。ほかに、10分より古い・5分より先の時刻の
+ * 知らせは捨てる（LINE の「Webhookの再送」は切ったままにする）。参加は400人まで。しまわない操作（現場を選ぶ・スタンプなど）は1人1日60回まで。
  * このファイルの返事は Reply だけ。お知らせ（Push）は使わない（無料の月200通を使わないため。使うのは3個めの催促だけ）。
  * doPost は何も返さない（中身を返すと別の住所への案内になり、LINEに「失敗」と記録されるため）。
  */
@@ -54,6 +59,10 @@ var API_DATA = 'https://api-data.line.me/v2/bot';
 var SITE_MINUTES = 30; // 選んだ現場を覚えておく時間
 var LIMIT_ALL = 100; // 1日の受付（全体）
 var LIMIT_USER = 30; // 1日の受付（1人）
+var LIMIT_OPS = 60; // 1日の、しまわない操作（現場を選ぶ・スタンプ・合言葉の送り直し・上限で断るなど。1人）
+var JOIN_MAX = 400; // 参加できる人数（変換した番号1つで19字。鍵の置き場の1つ9KBを超えないように）
+var EVENT_OLD_MS = 10 * 60 * 1000; // これより古い時刻の知らせは捨てる
+var EVENT_AHEAD_MS = 5 * 60 * 1000; // これより先の時刻の知らせは捨てる
 var MAX_TEXT = 500; // 日報の文の長さ
 var SEEN_SECONDS = 21600; // 受け取った知らせの番号を一時置き場に覚えておく時間（上限の6時間）
 var SET_SECONDS = 600; // まとめて送った写真の数えを覚えておく時間
@@ -64,6 +73,8 @@ var DRAIN = 'drainPhotos'; // 届いたあとに1回だけ動く自動実行で�
 var WAKE_AT = 'WAKE_AT'; // 片付けの自動実行を置いた時刻（置いてあるあいだは置き足さない）
 var WAKE_MS = 60 * 1000; // 届いてから片付けるまで
 var WAKE_STALE_MS = 15 * 60 * 1000; // 置いたまま、これより長く動いていなければ、置き直す
+var DRAIN_BUDGET_MS = 3 * 60 * 1000; // 片付けの始まりからこれを過ぎたら、残りの写真は次の回へ（このあと一言・受付の記録・6個め・4個めも動く）
+var TAKEN_STALE_MS = 7 * 60 * 1000; // 取り出した印がこれより古ければ、止まった片付けの写真（片付けは1回6分で止まる）
 var MADA_ON = 'MADA_ON'; // 3個め（日報まだ番）を入れた印（setupMada が入れる）
 var SENDERS = 'SENDERS'; // 現場ごとに最後に送った人の LINE の番号（3個めを入れたときだけ）
 var HOGUSHI_ON = 'HOGUSHI_ON'; // 4個め（日報ほぐし機・Hogushi.gs）を入れた印（setupHogushi が入れる）
@@ -94,6 +105,7 @@ var CAPTION_MAX = 200; // 一言の長さ
 var CAPTION_GROUPS = 5; // 表に書く前の一言を覚えておく数（鍵の置き場の1つ9KBを超えないように）
 var CAPTION_WAIT_MINUTES = 30; // しまっている途中の写真の一言を、待つ時間
 
+// 返事の文。自分の会社で使うときは、hello・onlyTextPhoto・limit の「見本」「架空の会社」を、自分の会社の言い方に書き換える
 var MSG = {
   hello: '見本のアカウントです（架空の会社）。個人の情報は送らないでください。',
   joined: '参加を受け付けました。現場を選んでください。',
@@ -102,6 +114,7 @@ var MSG = {
   onlyTextPhoto: '見本では、文と写真だけ受け付けます。',
   limit: '見本のため、本日の受付は終わりました。',
   handBusy: '手書きの読み取りが混んでいます。少し時間をおいて、もう一度送ってください。',
+  full: '参加できる人数の上限に達しているため、参加を受け付けられません。',
 };
 
 // LINEからの知らせの受け取り口（ウェブアプリとして公開する）
@@ -110,14 +123,14 @@ function doPost(e) {
   var props = PropertiesService.getScriptProperties();
   var secret = props.getProperty('PATH_SECRET');
   var key = (e && e.parameter && e.parameter.k) || (e && e.pathInfo) || '';
-  // 落とした理由は実行の一覧（console.log）に残す。合言葉そのものは出さず、長さだけ。
+  // 落とした理由は実行の一覧（console.log）に残す。合言葉は、中身も長さも出さない
   // Logger.log は、ウェブアプリとして呼ばれたときは実行の一覧に残らないので使わない
   if (!key) {
     console.log('受け取り先の住所に合言葉（?k=）が無いので、何もしませんでした');
     return;
   }
   if (!secret || key !== secret) {
-    console.log('受け取り先の合言葉が違うので、何もしませんでした（届いたのは ' + key.length + ' 文字・正しいのは ' + (secret || '').length + ' 文字）');
+    console.log('受け取り先の合言葉が違うので、何もしませんでした');
     return;
   }
   var body = parseBody_(e);
@@ -129,6 +142,10 @@ function doPost(e) {
     console.log('宛先が見本のアカウントと違うので、何もしませんでした');
     return;
   }
+  var stale = body.events.filter(function (event) {
+    return event && !fresh_(event);
+  }).length;
+  if (stale > 0) console.log('時刻が10分より古い・5分より先の知らせ ' + stale + ' 件を、何もせずに落としました（LINE の「Webhookの再送」は切ったままにする）');
   var joined = joinedList_(props);
   var events = body.events.filter(function (event) {
     return admitted_(props, joined, event);
@@ -201,10 +218,17 @@ function setup() {
 function admitted_(props, joined, event) {
   if (!event || event.mode === 'standby') return false; // 待機中の知らせは何もしない
   if (!event.source || event.source.type !== 'user') return false; // 1対1のやりとりだけ
+  if (!fresh_(event)) return false;
   if (event.type === 'follow') return true; // あいさつは返す
   if (joined.indexOf(hash_(props.getProperty('HASH_KEY'), event.source.userId)) >= 0) return true;
   var message = event.message;
   return event.type === 'message' && message.type === 'text' && sameWord_(message.text, props.getProperty('JOIN_WORD'));
+}
+
+// 届いた時刻の知らせか（10分より古い・5分より先・時刻の無い知らせは捨てる。合言葉が漏れたとき、作った知らせを過去の日報として入れさせない）
+function fresh_(event) {
+  var age = Date.now() - Number(event.timestamp);
+  return age <= EVENT_OLD_MS && age >= -EVENT_AHEAD_MS;
 }
 
 function handleEvent_(ctx, event) {
@@ -214,18 +238,28 @@ function handleEvent_(ctx, event) {
   ctx.day = stamp_(event.timestamp, 'yyyy/MM/dd');
   try {
     var who = hash_(ctx.hashKey, event.source.userId);
-    if (event.type === 'follow') return reply_(ctx, event, [textMsg_(MSG.hello)]);
+    if (event.type === 'follow') {
+      if (!opWithin_(ctx, who)) return;
+      return reply_(ctx, event, [textMsg_(MSG.hello)]);
+    }
     if (event.type !== 'message') return;
     var message = event.message;
     var joined = joinedList_(ctx.props);
     if (joined.indexOf(who) < 0) {
       if (message.type !== 'text' || !sameWord_(message.text, ctx.joinWord)) return; // admitted_ で絞ってあるので、ふつうは来ない
+      if (joined.length >= JOIN_MAX) {
+        if (!opWithin_(ctx, who)) return;
+        console.log('参加できる人数（' + JOIN_MAX + '人）に達しているので、参加を断りました');
+        count_(ctx, '上限で断った', 1);
+        return reply_(ctx, event, [textMsg_(MSG.full)]);
+      }
       joined.push(who);
       ctx.props.setProperty('JOINED', JSON.stringify(joined));
       return reply_(ctx, event, [chooser_(MSG.joined)]);
     }
     if (message.type === 'text') return onText_(ctx, event, who);
     if (message.type === 'image') return onImage_(ctx, event, who);
+    if (!opWithin_(ctx, who)) return;
     count_(ctx, '文と写真以外', 1);
     reply_(ctx, event, [textMsg_(MSG.onlyTextPhoto)]);
   } catch (err) {
@@ -239,22 +273,29 @@ function onText_(ctx, event, who) {
   var site = siteName_(text);
   var hand = ctx.props.getProperty(TEGAKI_ON) === '1';
   if (site) {
+    if (!opWithin_(ctx, who)) return;
     ctx.cache.put('site:' + who, site, SITE_MINUTES * 60);
     if (hand) return reply_(ctx, event, [handButton_(site + 'で受け付けます。日報や写真をどうぞ。紙の日報は「' + TEGAKI_KIND + '」を押してから写真を送ってください。')]);
     return reply_(ctx, event, [textMsg_(site + 'で受け付けます。日報や写真をどうぞ。')]);
   }
-  if (sameWord_(text, ctx.joinWord)) return reply_(ctx, event, [chooser_(MSG.already)]);
+  if (sameWord_(text, ctx.joinWord)) {
+    if (!opWithin_(ctx, who)) return;
+    return reply_(ctx, event, [chooser_(MSG.already)]);
+  }
   var current = ctx.cache.get('site:' + who);
   if (!current) {
+    if (!opWithin_(ctx, who)) return;
     count_(ctx, '現場を選ぶ前', 1);
     return reply_(ctx, event, [chooser_(MSG.choose)]);
   }
   // 6個め: 「手書き」を押したあと10分の写真は、手書きの日報として受け付ける（表には入れない）
   if (hand && sameWord_(text, TEGAKI_KIND)) {
+    if (!opWithin_(ctx, who)) return;
     ctx.cache.put('hand:' + who, current, TEGAKI_MINUTES * 60);
     return reply_(ctx, event, [textMsg_('手書きの日報の写真をどうぞ（' + current + '・' + TEGAKI_MINUTES + '分のあいだ）。')]);
   }
   if (!withinLimit_(ctx, who)) {
+    if (!opWithin_(ctx, who)) return;
     count_(ctx, '上限で断った', 1);
     return reply_(ctx, event, [textMsg_(MSG.limit)]);
   }
@@ -276,15 +317,16 @@ function onText_(ctx, event, who) {
 function onImage_(ctx, event, who) {
   var set = event.message.imageSet;
   var current = ctx.cache.get('site:' + who);
+  // 返事をするときだけ、しまわない操作に数える（まとめて送った写真への返事は1回なので、1回と数える）
   if (!current) {
     count_(ctx, '現場を選ぶ前', 1);
-    if (firstInSet_(ctx, set, 'choose')) reply_(ctx, event, [chooser_(MSG.choose)]);
+    if (firstInSet_(ctx, set, 'choose') && opWithin_(ctx, who)) reply_(ctx, event, [chooser_(MSG.choose)]);
     return;
   }
-  var queue = listProp_(ctx.props, 'QUEUE');
+  var queue = listProp_(ctx.props, 'QUEUE'); // 片付けが取り出して、しまっている途中の写真も数える
   if (!withinLimit_(ctx, who) || queue.length >= QUEUE_MAX) {
     count_(ctx, '上限で断った', 1);
-    if (firstInSet_(ctx, set, 'limit')) reply_(ctx, event, [textMsg_(MSG.limit)]);
+    if (firstInSet_(ctx, set, 'limit') && opWithin_(ctx, who)) reply_(ctx, event, [textMsg_(MSG.limit)]);
     return;
   }
   var eventId = event.webhookEventId;
@@ -295,7 +337,7 @@ function onImage_(ctx, event, who) {
   var hand = ctx.props.getProperty(TEGAKI_ON) === '1' && ctx.cache.get('hand:' + who) === current; // 6個め: 「手書き」を押したあと10分
   if (hand && listProp_(ctx.props, TEGAKI_QUEUE).length >= TEGAKI_QUEUE_MAX) {
     count_(ctx, '上限で断った', 1); // AI が止まっているあいだに溜まりすぎない（読めない写真を、表に入れたまま失わない）
-    if (firstInSet_(ctx, set, 'handBusy')) reply_(ctx, event, [textMsg_(MSG.handBusy)]);
+    if (firstInSet_(ctx, set, 'handBusy') && opWithin_(ctx, who)) reply_(ctx, event, [textMsg_(MSG.handBusy)]);
     return;
   }
   var item = {
@@ -324,9 +366,9 @@ function onImage_(ctx, event, who) {
 }
 
 // 3個め（日報まだ番）を入れたときだけ、その現場に最後に日報か写真を送った人の LINE の番号を覚える（催促の宛先）。
-// 覚えられなくても、受け付けと返事は止めない
+// 印があっても Mada.gs が無ければ覚えない（3個めをやめた人のところで、番号を覚え続けない）。覚えられなくても、受け付けと返事は止めない
 function rememberSender_(ctx, site, userId) {
-  if (ctx.props.getProperty(MADA_ON) !== '1') return;
+  if (ctx.props.getProperty(MADA_ON) !== '1' || typeof sendMada !== 'function') return;
   try {
     var senders = JSON.parse(ctx.props.getProperty(SENDERS) || '{}');
     if (senders[site] === userId) return;
@@ -451,7 +493,8 @@ function rowOf_(sheet, first, col, value) {
 
 // 片付け（届いたあとに受け取りが置く、1回だけ動く自動実行）。控えた写真をLINEから取り出して、現場のフォルダと表にしまい、受付の記録を書く。
 // 終わったときに、まだ残っている仕事（止まって戻した写真・待っている一言）があれば、次の片付けを置く。
-// 順番待ちは、控えを取り出すときと結果を書くときだけ使う（写真の取り出しは数秒かかるので、その間に受け取りを止めない）
+// 順番待ちは、控えを取り出すときと結果を書くときだけ使う（写真の取り出しは数秒かかるので、その間に受け取りを止めない）。
+// 取り出した写真は控えに残したまま印（g）を付け、しまい終わってから外す（途中で止まっても、写真を失わない）
 function drainPhotos() {
   var started = Date.now();
   var props = PropertiesService.getScriptProperties();
@@ -465,13 +508,20 @@ function drainPhotos() {
     clearWake_(props);
     if (!pendingWork_(props)) return; // 何も無い回は書かない
     wake_(props); // 保険: このあと途中で落ちても（表を開けない・時間切れ）、1分後にもう一度片付ける。最後まで済んで仕事が無ければ外す
-    items = listProp_(props, 'QUEUE');
-    props.setProperty('QUEUE', '[]');
+    // 印の無い写真と、止まった片付けの写真（印が古い）を、この回が取り出す。ほかの回がしまっている写真には触らない
+    var queue = listProp_(props, 'QUEUE').map(function (item) {
+      return item.g && started - item.g <= TAKEN_STALE_MS ? item : marked_(item, started);
+    });
+    items = queue.filter(function (item) {
+      return item.g === started;
+    });
+    if (items.length > 0) props.setProperty('QUEUE', JSON.stringify(queue));
   } finally {
     lock.releaseLock();
   }
   var ctx = context_(props);
   var results = items.map(function (item) {
+    if (Date.now() - started > DRAIN_BUDGET_MS) return 'later'; // 残りは次の回（控えに残す）
     try {
       return storePhoto_(ctx, item);
     } catch (err) {
@@ -480,30 +530,38 @@ function drainPhotos() {
     }
   });
   if (!lock.tryLock(LOCK_MS * 3)) {
-    console.log('写真の結果を書く順番待ちが取れませんでした（' + items.length + ' 件）');
+    console.log('写真の結果を書く順番待ちが取れませんでした（' + items.length + ' 件。控えに残してあり、取り出した印が古くなってから、もう一度扱います）');
     rewake_(props);
     return;
   }
   var notes;
   var captions;
   try {
-    var queue = listProp_(props, 'QUEUE');
-    var done = listProp_(props, 'DONE');
+    var resultOf = {};
     items.forEach(function (item, i) {
+      resultOf[item.e] = results[i];
+    });
+    var done = listProp_(props, 'DONE');
+    var left = [];
+    // いまの控えを読み直して、この回が取り出した写真だけを片付ける（そのあいだに届いた写真・ほかの回の写真は、そのまま残す）
+    listProp_(props, 'QUEUE').forEach(function (item) {
+      var result = item.g === started ? resultOf[item.e] : undefined;
+      if (result === undefined) return left.push(item);
       ctx.day = item.d;
-      if (results[i] === 'retry' && (item.r || 0) < 2) {
-        item.r = (item.r || 0) + 1; // 止まった写真は控えに戻して、次の回にしまう（3回まで）
-        queue.push(item);
-        return;
+      if (result === 'later') return left.push(marked_(item, 0)); // 時間で残した写真（止まった回数には数えない）
+      if (result === 'retry' && (item.r || 0) < 2) {
+        var again = marked_(item, 0);
+        again.r = (item.r || 0) + 1; // 止まった写真は控えに残して、次の回にしまう（3回まで）
+        return left.push(again);
       }
       done.push(item.e);
-      if (results[i] === 'stored' || results[i] === 'stored-no-ledger') count_(ctx, '受け付けた件数', 1);
-      if (results[i] === 'unreadable') count_(ctx, '写真を取り出せない', 1);
-      if (results[i] === 'retry' || results[i] === 'stored-no-ledger') count_(ctx, '止まった', 1);
-      if (results[i] === 'unreadable' || results[i] === 'retry') countDown_(ctx, item.w); // しまえなかった写真は、1日の件数から外す
+      if (result === 'stored' || result === 'stored-no-ledger') count_(ctx, '受け付けた件数', 1);
+      if (result === 'unreadable') count_(ctx, '写真を取り出せない', 1);
+      if (result === 'retry' || result === 'stored-no-ledger') count_(ctx, '止まった', 1);
+      if (result === 'unreadable' || result === 'retry') countDown_(ctx, item.w); // しまえなかった写真は、1日の件数から外す
     });
     done = done.slice(-DONE_KEEP);
-    props.setProperty('QUEUE', JSON.stringify(queue));
+    props.setProperty('QUEUE', JSON.stringify(left));
     props.setProperty('DONE', JSON.stringify(done));
     captions = takeCaptions_(props, done, Date.now());
     notes = JSON.parse(props.getProperty('NOTES') || '{}');
@@ -613,6 +671,14 @@ function clearWake_(props) {
   if (props.getProperty(WAKE_AT)) props.deleteProperty(WAKE_AT);
 }
 
+// 控えの写真の写しに、取り出した印を付ける（at が 0 なら外す）
+function marked_(item, at) {
+  var copy = JSON.parse(JSON.stringify(item));
+  if (at) copy.g = at;
+  else delete copy.g;
+  return copy;
+}
+
 function rewake_(props) {
   clearWake_(props);
   wake_(props);
@@ -632,7 +698,7 @@ function storePhoto_(ctx, item) {
   var file = savePhoto_(ctx, item);
   if (!file) return 'unreadable';
   if (item.k) {
-    // 6個め: 手書きの日報は「手書き」の行（内容は AI が読むまで「読み取り待ち」）。台帳には貼らない（工事写真ではない・本人の決定 11/23）。
+    // 6個め: 手書きの日報は「手書き」の行（内容は AI が読むまで「読み取り待ち」）。台帳には貼らない（工事写真ではないため）。
     // 読む控えに先に足してから行を入れる（行を入れたあとに止まっても、読み取り待ちのまま残らない）。足せなければ、人が写真を見る印
     var queued = addHand_(ctx.props, item.e, file.getId());
     sheet.appendRow([stamp_(item.t, 'yyyy/MM/dd HH:mm'), item.s, TEGAKI_KIND, queued ? TEGAKI_WAITING : TEGAKI_FAILED, file.getUrl(), item.e]);
@@ -771,6 +837,18 @@ function counts_(ctx) {
 function withinLimit_(ctx, who) {
   var counts = counts_(ctx);
   return counts.all < LIMIT_ALL && (counts.users[who] || 0) < LIMIT_USER;
+}
+
+// しまわない操作（現場を選ぶ・スタンプ・合言葉の送り直し・上限で断るなど）を、1人1日60回まで数える。超えたら false（返事もせずに捨てる。
+// 連打で、無料のアカウントの1日の上限を使わせない）。受付の記録には、超えた最初の1回だけ残す。数えは一時置き場に置く（6時間あくと消える）
+function opWithin_(ctx, who) {
+  var key = 'ops:' + ctx.day + ':' + who;
+  var used = Number(ctx.cache.get(key) || 0);
+  if (used > LIMIT_OPS) return false;
+  ctx.cache.put(key, String(used + 1), SEEN_SECONDS);
+  if (used < LIMIT_OPS) return true;
+  count_(ctx, '上限で断った', 1);
+  return false;
 }
 
 function countUp_(ctx, who) {

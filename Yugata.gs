@@ -11,6 +11,10 @@
  * 日報の無い現場は「まだ届いていません」と書き、全部の現場に無い日も送る（届いていないことが分かるように）。
  * 送るのは1日1通。メールの送信の上限（無料のアカウントは1日100人ぶん。宛先の人数で数える）の残りが足りない日は、送らずに止まる（止まったことは Google から持ち主に届く）。
  * 記録（console.log）には件数だけを出し、日報の中身と送り先は出さない。
+ *
+ * 「設定」のシート（送り先）は、setupYugata などが保護をかけて、持ち主だけが書き換えられるようにする（表を「編集者」で共有した人に、
+ * 送り先を自分のアドレスに書き換えさせて、日報を外へ送らせないため）。送るときは、保護をかけたシートを番号で探し（名前を変えて
+ * 別のシートに差し替えられても読まない）、保護が外れていれば送らずに止まる。日報の文に書かれたリンクは、メールには入れない。
  */
 
 var YUGATA = 'sendYugata'; // 毎日の自動実行で動かす関数
@@ -18,6 +22,8 @@ var YUGATA_HOUR = 17;
 var YUGATA_NAME = '日報ゆうがた便'; // メールの差出人の名前
 var YUGATA_NONE = 'まだ届いていません';
 var SETTINGS_SHEET = '設定'; // 1行に1つ、A列に項目・B列に値（このあとの道具も、ここに行を足す）
+var SETTINGS_ID = 'SETTINGS_ID'; // 保護をかけた「設定」のシートの番号（スクリプト プロパティ）
+var NO_LINK = '（リンクは省きました）';
 var YUGATA_TO_LABEL = 'ゆうがた便の送り先';
 var EMAIL_PATTERN = /^[^\s@,、]+@[^\s@,、]+\.[^\s@,、]+$/;
 
@@ -54,10 +60,10 @@ function yugataRecipients_(ss) {
 }
 
 // 「設定」のシートの、その項目の右のマスのメールアドレス（カンマか読点で区切れば何人でも）。3個め（Mada.gs）も使う。
-// 空・メールアドレスでないものがあれば止まる（どれが違うかは、何番目かだけ言う。アドレスは記録に出さない）
+// 保護が外れていれば・空・メールアドレスでないものがあれば止まる（どれが違うかは、何番目かだけ言う。アドレスは記録に出さない）
 function settingAddresses_(ss, label, setupName) {
-  var sheet = ss.getSheetByName(SETTINGS_SHEET);
-  var row = sheet ? rowOf_(sheet, 1, 1, label) : 0;
+  var sheet = guardedSettings_(ss, setupName);
+  var row = rowOf_(sheet, 1, 1, label);
   if (!row) throw new Error('「' + SETTINGS_SHEET + '」のシートに「' + label + '」の欄がありません。先に ' + setupName + ' を動かしてください');
   var list = String(sheet.getRange(row, 2).getValue())
     .split(/[,、\s]+/)
@@ -80,7 +86,7 @@ function yugataMail_(ss, now) {
   var count = 0;
   todaysReports_(ss, Utilities.formatDate(now, TZ, 'yyyy/MM/dd')).forEach(function (report) {
     if (!bySite[report.site]) return; // 一覧に無い現場（表を手で直した行など）は入れない
-    bySite[report.site].push(report.time + ' ' + report.text);
+    bySite[report.site].push(report.time + ' ' + noLinks_(report.text));
     count++;
   });
   var sections = SITES.map(function (site) {
@@ -117,14 +123,53 @@ function reportsBetween_(ss, from, to) {
     });
 }
 
+// 「設定」のシート（無ければ作る）に保護をかけて、番号を覚える。setup のたびに呼ぶ（ゆるんだ保護を締め直す）
 function settingsSheet_(ss) {
-  var sheet = ss.getSheetByName(SETTINGS_SHEET);
-  if (sheet) return sheet;
-  sheet = ss.insertSheet(SETTINGS_SHEET);
-  [180, 360].forEach(function (width, i) {
-    sheet.setColumnWidth(i + 1, width);
-  });
+  var sheet = settingsById_(ss) || ss.getSheetByName(SETTINGS_SHEET);
+  if (!sheet) {
+    sheet = ss.insertSheet(SETTINGS_SHEET);
+    [180, 360].forEach(function (width, i) {
+      sheet.setColumnWidth(i + 1, width);
+    });
+  }
+  // 保護をかけただけでは、表と同じ人が書き換えられる。持ち主のほかの編集者を外して、はじめて守られる（持ち主は外れない）
+  var protection = sheet.protect().setDescription('送り先の欄。持ち主だけが書き換えられます（ネコの手の setup がかけた保護）').setWarningOnly(false);
+  protection.removeEditors(protection.getEditors());
+  if (protection.canDomainEdit()) protection.setDomainEdit(false);
+  PropertiesService.getScriptProperties().setProperty(SETTINGS_ID, String(sheet.getSheetId()));
   return sheet;
+}
+
+// 保護をかけた「設定」のシート（覚えた番号で探す）。無い・保護がゆるんでいれば止まる
+function guardedSettings_(ss, setupName) {
+  var sheet = settingsById_(ss);
+  if (!sheet) throw new Error('保護をかけた「' + SETTINGS_SHEET + '」のシートが見つかりません。先に ' + setupName + ' を動かしてください');
+  var guarded = sheet.getProtections(SpreadsheetApp.ProtectionType.SHEET).some(function (protection) {
+    return !protection.isWarningOnly() && !protection.canDomainEdit() && protection.getEditors().length <= 1; // 編集者は持ち主だけ
+  });
+  if (!guarded) {
+    throw new Error(
+      '「' + SETTINGS_SHEET + '」のシートの保護が外れているか、ゆるんでいます（表を共有した人が送り先を書き換えられます）。' + setupName + ' を動かし直してください。' +
+        '動かし直しても止まるときは、スクリプトを動かすアカウントが、表の持ち主かを確かめてください（持ち主でないと、保護の編集者が2人残ります）',
+    );
+  }
+  return sheet;
+}
+
+function settingsById_(ss) {
+  var id = PropertiesService.getScriptProperties().getProperty(SETTINGS_ID);
+  if (!id) return null;
+  var found = ss.getSheets().filter(function (sheet) {
+    return String(sheet.getSheetId()) === id;
+  });
+  return found.length > 0 ? found[0] : null;
+}
+
+// メールに入れる日報の文のリンクを省く（日報に書かれた知らない住所を、メールから押せる形で届けない）
+function noLinks_(text) {
+  // http・www で始まるもの（英数字と記号が続くかぎり）と、example.com/x のような住所だけのもの。すき間なく続く日本語は残す。
+  // 日本語の入った住所・全角で書いた住所などは、省けないことがある
+  return String(text).replace(/(?:https?:\/\/|www\.)[!-~]+|\b[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}\b(?:\/[!-~]*)?/gi, NO_LINK);
 }
 
 // 項目の行（無ければ、いちばん下に足す）

@@ -20,6 +20,7 @@
  * 回数の上限・払いが尽きた・AI の窓口の一時的な不調・通信が切れたときは、その回は読まずに、10分あけて読む。鍵が違う・無いときは止まる
  * （止まったことは Google から持ち主に届く）。
  * 無料の枠では、送った文が Google の改善に使われ、人が読むことがある。名前や現場名が入る本物の日報を流す前に、有料の枠にする（手順書）。
+ * 知らせのメールには、日報の文と困りごとに書かれたリンクを入れない（表には、そのまま残す）。
  * 記録（console.log）には件数だけを出し、日報の中身・鍵・知らせ先は出さない。
  */
 
@@ -307,7 +308,7 @@ function troubleMail_(ss, troubles) {
   var lines = troubles.map(function (t) {
     if (sites.indexOf(t.site) < 0) sites.push(t.site);
     var at = t.at instanceof Date ? Utilities.formatDate(t.at, TZ, 'yyyy/MM/dd HH:mm') : String(t.at);
-    return '【' + t.site + '】' + at.slice(11, 16) + '\n困りごと: ' + t.trouble + '\n元の文: ' + t.text;
+    return '【' + t.site + '】' + at.slice(11, 16) + '\n困りごと: ' + noLinks_(t.trouble) + '\n元の文: ' + noLinks_(t.text);
   });
   var day = Utilities.formatDate(new Date(Date.now()), TZ, 'M/d');
   MailApp.sendEmail({
