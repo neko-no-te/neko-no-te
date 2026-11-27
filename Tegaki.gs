@@ -15,6 +15,8 @@
  * AI は読みちがえることがある（とくに数字。元の写真のリンクを行に残す）。読めない字は「？」にして推測しないよう頼む。
  * 形が読めない返事（安全の決まりに当たったなど）や、写真そのものを断られた（壊れた写真など）ときは、次の片付けでもう一度（3回まで）。
  * だめなら「読めませんでした」と書く（後ろの写真は止めない）。写真が消えていても同じ。片付けの始まりから4分を過ぎたら、残りは次の回。
+ * 読めたのに日報の表に書けないとき（「内容」の列に入力の決まりを付けたなど）も、次の片付けでもう一度（3回まで）。だめなら控えから外す
+ * （AI を呼び続けない。行は「読み取り待ち」のまま残るので、人が写真のリンクを開いて書き入れる）。日報のシートが無いときは、AI を呼ばずに同じ数え方をする。
  * 回数の上限・払いが尽きた・AI の窓口の一時的な不調・通信が切れたときは、その回は読まずに、10分あけて読む。鍵が違う・無いときは止まる
  * （止まったことは Google から持ち主に届く）。
  * 無料の枠では、送った写真が Google の改善に使われ、人が見ることがある。名前の入る本物の日報を流す前に、有料の枠にする（手順書）。
@@ -25,7 +27,7 @@ var TEGAKI_KEY = 'GEMINI_API_KEY'; // 4個めと同じ鍵
 var TEGAKI_MODEL = 'gemini-3.5-flash-lite';
 var TEGAKI_URL = 'https://generativelanguage.googleapis.com/v1beta/models/' + TEGAKI_MODEL + ':generateContent';
 var TEGAKI_BATCH = 5; // 1回の片付けで読む写真の数（自動実行の1日90分と、1回6分の上限の中で）
-var TEGAKI_TRIES = 3; // 形が読めない返事のとき、読み直す回数
+var TEGAKI_TRIES = 3; // 形が読めない返事のとき・読めたのに日報の表に書けないとき、やり直す回数（合わせて3回まで）
 var TEGAKI_WAIT_MINUTES = 10; // AI の窓口が受け付けなかったとき、あける時間
 var TEGAKI_BUSY_SECONDS = 300; // 読んでいる最中の印（2つの片付けが重なっても、同じ写真を2回読まない）
 var TEGAKI_MAX_TEXT = 500; // 内容の長さ（1個めの日報の文と同じ）
@@ -71,7 +73,15 @@ function tegaki_(props, started) {
     if (batch.length === 0) return;
     var key = tegakiKey_(props);
     var sheet = SpreadsheetApp.openById(props.getProperty('SHEET_ID')).getSheetByName(REPORT_SHEET);
-    var count = { read: 0, failed: 0, retry: 0 };
+    if (!sheet) {
+      // 日報のシートが無い（名前を替えたなど）: AI を呼ぶ前に分かるので、読ませずに、書けなかった回数に数える
+      batch.forEach(function (item) {
+        results[item.e] = unwritten_(item);
+      });
+      console.log('手書きすいこみ口: 日報のシート「' + REPORT_SHEET + '」が見つかりません（' + batch.length + ' 枚。3回見つからなければ控えから外す。シートの名前を替えていないか確かめてください）');
+      return;
+    }
+    var count = { read: 0, failed: 0, retry: 0, unwritten: 0 };
     for (var i = 0; i < batch.length; i++) {
       if (Date.now() - (started || Date.now()) > TEGAKI_BUDGET_MS) break; // 残りは次の片付け
       var item = batch[i];
@@ -89,7 +99,14 @@ function tegaki_(props, started) {
         continue;
       }
       if (content === null) content = TEGAKI_FAILED;
-      writeHand_(sheet, item.e, content);
+      try {
+        writeHand_(sheet, item.e, content);
+      } catch (err) {
+        // 表に書けない（「内容」の列に入力の決まりを付けたなど）: AI を呼び直し続けないよう、読み直しの回数に数え、3回で控えから外す
+        results[item.e] = unwritten_(item);
+        count.unwritten++;
+        continue;
+      }
       results[item.e] = 'done';
       if (TEGAKI_NOTES.indexOf(content) >= 0) count.failed++;
       else count.read++;
@@ -98,10 +115,18 @@ function tegaki_(props, started) {
     if (count.read + count.failed + count.retry > 0) {
       console.log('手書きすいこみ口: ' + (count.read + count.failed) + ' 枚（読めず・字なし ' + count.failed + '・もう一度 ' + count.retry + '）');
     }
+    if (count.unwritten > 0) {
+      console.log('手書きすいこみ口: 日報の表に書けなかった ' + count.unwritten + ' 枚（3回書けなければ控えから外す。行は読み取り待ちのまま。表の列の入力の決まりなどを確かめてください）');
+    }
   } finally {
     finishBatch_(props, results); // 途中で止まっても（鍵が違うなど）、読み終えた写真は控えから外す
     cache.remove('tegaki:busy');
   }
+}
+
+// 日報の表に書けなかった写真の扱い: 3回めまでは次の片付けでもう一度（'retry'）、3回めで控えから外す（'done'）
+function unwritten_(item) {
+  return (item.r || 0) + 1 < TEGAKI_TRIES ? 'retry' : 'done';
 }
 
 function tegakiKey_(props) {

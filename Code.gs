@@ -16,6 +16,8 @@
  *   HOGUSHI_ON・HOGUSHI_PENDING・HOGUSHI_MARKED・GEMINI_API_KEY  4個め（日報ほぐし機・Hogushi.gs）を入れたときだけ: その印・読ませる日報がある印・
  *                     入れる前の日報に印を付け終えた印・AI の鍵（使う人が貼る）
  *   TEGAKI_ON・TEGAKI_QUEUE  6個め（手書きすいこみ口・Tegaki.gs）を入れたときだけ: その印と、AI に読ませる手書きの写真（受付番号とドライブの番号）
+ *   RYOSHU_ON・RYOSHU_QUEUE・RYOSHU_SHEET_ID・RYOSHU_FOLDER_ID  8個め（レシートすいこみ口・Ryoshu.gs）を入れたときだけ: その印・AI に読ませる
+ *                     レシートの写真・経費の表（日報とは別のファイル）・領収書の写真のフォルダ（setupRyoshu が入れる）
  *   WAKE_AT  片付けの自動実行を置いた時刻（プログラムが使う）
  *   SETTINGS_ID  2個め（Yugata.gs）からあと: 保護をかけた「設定」のシートの番号（setupYugata などが入れる）
  *
@@ -91,6 +93,11 @@ var TEGAKI_FAILED = '（読めませんでした。写真を見てください�
 var TEGAKI_NOT_REPORT = '（日報の字が見つかりませんでした。写真を見てください）';
 var TEGAKI_NOTES = [TEGAKI_WAITING, TEGAKI_FAILED, TEGAKI_NOT_REPORT]; // 人が写真を見る手書きの行（4個めは読まない＝中身なしと数えず、まだ番は届いたと数える）
 var REPORT_KINDS = ['日報', TEGAKI_KIND]; // 日報として読む・数える種類（4個めの分け方・2個めの夕方のメール・3個めのまだ番）
+var RYOSHU_ON = 'RYOSHU_ON'; // 8個め（レシートすいこみ口・Ryoshu.gs）を入れた印（setupRyoshu が入れる）
+var RYOSHU_QUEUE = 'RYOSHU_QUEUE'; // 8個めに読ませるレシートの写真（しまったあとに足し、片付けが8個めを呼ぶ）
+var RYOSHU_KIND = '領収書'; // ボタンの字
+var RYOSHU_MINUTES = 10; // 「領収書」を押してから、送った写真をレシートとして受け付ける時間
+var RYOSHU_QUEUE_MAX = 60; // 読む前のレシートの控えがこれだけあれば、受け付けで断る（手書きの控えと同じ考え方）
 var RECENT_ROWS = 500; // 同じ知らせの2回目・一言を入れる写真の行は、日報の下からこの行数までで探す（全部の現場が1枚に入るので、表が大きくなってもLINEの2秒に間に合うように）
 
 // 写真台帳（印刷用の形）。写真1枚で4行の枠。A4の縦に3枚入る高さにそろえる
@@ -114,6 +121,7 @@ var MSG = {
   onlyTextPhoto: '見本では、文と写真だけ受け付けます。',
   limit: '見本のため、本日の受付は終わりました。',
   handBusy: '手書きの読み取りが混んでいます。少し時間をおいて、もう一度送ってください。',
+  receiptBusy: 'レシートの読み取りが混んでいます。少し時間をおいて、もう一度送ってください。',
   full: '参加できる人数の上限に達しているため、参加を受け付けられません。',
 };
 
@@ -272,11 +280,11 @@ function onText_(ctx, event, who) {
   var text = String(event.message.text).trim();
   var site = siteName_(text);
   var hand = ctx.props.getProperty(TEGAKI_ON) === '1';
+  var receipt = receiptOn_(ctx.props);
   if (site) {
     if (!opWithin_(ctx, who)) return;
     ctx.cache.put('site:' + who, site, SITE_MINUTES * 60);
-    if (hand) return reply_(ctx, event, [handButton_(site + 'で受け付けます。日報や写真をどうぞ。紙の日報は「' + TEGAKI_KIND + '」を押してから写真を送ってください。')]);
-    return reply_(ctx, event, [textMsg_(site + 'で受け付けます。日報や写真をどうぞ。')]);
+    return reply_(ctx, event, [siteReply_(site, hand, receipt)]);
   }
   if (sameWord_(text, ctx.joinWord)) {
     if (!opWithin_(ctx, who)) return;
@@ -292,7 +300,23 @@ function onText_(ctx, event, who) {
   if (hand && sameWord_(text, TEGAKI_KIND)) {
     if (!opWithin_(ctx, who)) return;
     ctx.cache.put('hand:' + who, current, TEGAKI_MINUTES * 60);
+    ctx.cache.remove('receipt:' + who); // 「手書き」と「領収書」は、あとから押したほうが効く
+    var rec = JSON.parse(ctx.cache.get('cap:' + who) || 'null');
+    if (rec && rec.r === 1) ctx.cache.remove('cap:' + who); // レシートの一言の待ちも閉じる（このあとの文を、レシートの一言に吸わせない）
     return reply_(ctx, event, [textMsg_('手書きの日報の写真をどうぞ（' + current + '・' + TEGAKI_MINUTES + '分のあいだ）。')]);
+  }
+  // 8個め: 「領収書」を押したあと10分の写真は、レシートとして受け付ける（表には入れない）
+  if (receipt && sameWord_(text, RYOSHU_KIND)) {
+    if (!opWithin_(ctx, who)) return;
+    ctx.cache.put('receipt:' + who, current, RYOSHU_MINUTES * 60);
+    ctx.cache.remove('hand:' + who);
+    return reply_(ctx, event, [textMsg_('レシートの写真をどうぞ（' + current + '・' + RYOSHU_MINUTES + '分のあいだ）。写真のあとに、何に使ったかを一言どうぞ（例: 会議費 打合せのお茶）。')]);
+  }
+  // 8個め: レシートの写真のあと5分以内の最初の文は、そのレシートの一言（日報の表には入れない。ほぐし機・夕方のメール・まだ番に混ぜない）
+  if (receiptCaptionWaiting_(ctx, who, current, event)) {
+    if (!opWithin_(ctx, who)) return;
+    captionFromText_(ctx, who, current, event, plainText_(text.slice(0, CAPTION_MAX)));
+    return reply_(ctx, event, [textMsg_('受け付けました（' + current + '・' + RYOSHU_KIND + 'の一言）')]);
   }
   if (!withinLimit_(ctx, who)) {
     if (!opWithin_(ctx, who)) return;
@@ -334,10 +358,16 @@ function onImage_(ctx, event, who) {
     return item.e === eventId;
   });
   if (seen || listProp_(ctx.props, 'DONE').indexOf(eventId) >= 0) return; // 一時置き場が先に消えたときの2回目
-  var hand = ctx.props.getProperty(TEGAKI_ON) === '1' && ctx.cache.get('hand:' + who) === current; // 6個め: 「手書き」を押したあと10分
+  var receipt = receiptOn_(ctx.props) && ctx.cache.get('receipt:' + who) === current; // 8個め: 「領収書」を押したあと10分
+  var hand = !receipt && ctx.props.getProperty(TEGAKI_ON) === '1' && ctx.cache.get('hand:' + who) === current; // 6個め: 「手書き」を押したあと10分
   if (hand && listProp_(ctx.props, TEGAKI_QUEUE).length >= TEGAKI_QUEUE_MAX) {
     count_(ctx, '上限で断った', 1); // AI が止まっているあいだに溜まりすぎない（読めない写真を、表に入れたまま失わない）
     if (firstInSet_(ctx, set, 'handBusy') && opWithin_(ctx, who)) reply_(ctx, event, [textMsg_(MSG.handBusy)]);
+    return;
+  }
+  if (receipt && listProp_(ctx.props, RYOSHU_QUEUE).length >= RYOSHU_QUEUE_MAX) {
+    count_(ctx, '上限で断った', 1);
+    if (firstInSet_(ctx, set, 'receiptBusy') && opWithin_(ctx, who)) reply_(ctx, event, [textMsg_(MSG.receiptBusy)]);
     return;
   }
   var item = {
@@ -351,18 +381,20 @@ function onImage_(ctx, event, who) {
     d: ctx.day,
   };
   if (hand) item.k = 1;
+  if (receipt) item.k = 2;
   queue.push(item);
   ctx.props.setProperty('QUEUE', JSON.stringify(queue));
   countUp_(ctx, who);
-  rememberSender_(ctx, current, event.source.userId);
+  if (!receipt) rememberSender_(ctx, current, event.source.userId); // レシートは現場の報告ではないので、まだ番の催促の宛先にしない
   try {
-    if (!hand) rememberPhoto_(ctx, who, current, event); // 手書きの日報の写真には、一言を付けない（読んだ文を上書きしない）
+    if (!hand) rememberPhoto_(ctx, who, current, event, receipt); // 手書きの日報の写真には、一言を付けない（読んだ文を上書きしない）
   } catch (err) {
     console.log('写真を一言のために覚えられませんでした: ' + (err && err.message)); // 写真は控えてあるので、返事は出す
   }
   ctx.worked = true;
-  if (!set) return reply_(ctx, event, [textMsg_(queuedMessage_(current, 1, hand))]);
-  if (setComplete_(ctx, set)) reply_(ctx, event, [textMsg_(queuedMessage_(current, set.total, hand))]);
+  var kind = receipt ? RYOSHU_KIND : hand ? TEGAKI_KIND : null;
+  if (!set) return reply_(ctx, event, [textMsg_(queuedMessage_(current, 1, kind))]);
+  if (setComplete_(ctx, set)) reply_(ctx, event, [textMsg_(queuedMessage_(current, set.total, kind))]);
 }
 
 // 3個め（日報まだ番）を入れたときだけ、その現場に最後に日報か写真を送った人の LINE の番号を覚える（催促の宛先）。
@@ -379,18 +411,34 @@ function rememberSender_(ctx, site, userId) {
   }
 }
 
-function queuedMessage_(site, count, hand) {
-  if (hand) return '受け付けました（' + site + '・' + TEGAKI_KIND + count + '枚）。表には2分ほどで入ります。'; // AI が読む分、遅い
+// kind は、手書き（TEGAKI_KIND）・領収書（RYOSHU_KIND）・ふつうの写真（null）
+function queuedMessage_(site, count, kind) {
+  if (kind) return '受け付けました（' + site + '・' + kind + count + '枚）。表には2分ほどで入ります。'; // AI が読む分、遅い
   return '受け付けました（' + site + '・写真' + count + '枚）。表には1分ほどで入ります。';
+}
+
+// 8個め（Ryoshu.gs）を入れたか（印があっても、ファイルが無ければ入れていないと扱う）
+function receiptOn_(props) {
+  return props.getProperty(RYOSHU_ON) === '1' && typeof ryoshu_ === 'function';
+}
+
+// 8個め: いま届いた文が、レシートの写真のあと5分以内の、同じ現場の最初の文か
+function receiptCaptionWaiting_(ctx, who, site, event) {
+  var rec = JSON.parse(ctx.cache.get('cap:' + who) || 'null');
+  if (!rec || rec.r !== 1 || rec.s !== site) return false;
+  return rec.photos.some(function (photo) {
+    return event.timestamp - photo.t <= CAPTION_MINUTES * 60000;
+  });
 }
 
 // ===== 写真のあとの一言 =====
 
-// まだ一言の付いていない写真を、人ごとに覚えておく（同じ現場に続けて送った写真が、1つのまとまり）
-function rememberPhoto_(ctx, who, site, event) {
+// まだ一言の付いていない写真を、人ごとに覚えておく（同じ現場に続けて送った、同じ種類の写真が、1つのまとまり。receipt はレシートの写真）
+function rememberPhoto_(ctx, who, site, event, receipt) {
   var key = 'cap:' + who;
   var rec = JSON.parse(ctx.cache.get(key) || 'null');
-  if (!rec || rec.s !== site) rec = { s: site, photos: [] };
+  if (!rec || rec.s !== site || (rec.r === 1) !== !!receipt) rec = { s: site, photos: [] };
+  if (receipt) rec.r = 1;
   rec.photos.push({ e: event.webhookEventId, t: event.timestamp });
   ctx.cache.put(key, JSON.stringify(rec), SET_SECONDS);
 }
@@ -412,7 +460,9 @@ function captionFromText_(ctx, who, site, event, caption) {
     });
   if (ids.length === 0) return;
   var groups = listProp_(ctx.props, 'CAPS');
-  groups.push({ c: caption, s: site, ids: ids, t: event.timestamp });
+  var group = { c: caption, s: site, ids: ids, t: event.timestamp };
+  if (rec.r === 1) group.r = 1; // レシートの一言（経費の表に入れる）
+  groups.push(group);
   ctx.props.setProperty('CAPS', JSON.stringify(groups.slice(-CAPTION_GROUPS)));
 }
 
@@ -430,10 +480,14 @@ function takeCaptions_(props, done, now) {
   groups.forEach(function (group) {
     var waiting = group.ids.filter(function (id) {
       if (!finished[id]) return true;
-      ready.push({ s: group.s, e: id, c: group.c });
+      ready.push({ s: group.s, e: id, c: group.c, r: group.r });
       return false;
     });
-    if (waiting.length > 0 && now - group.t <= CAPTION_WAIT_MINUTES * 60000) left.push({ c: group.c, s: group.s, ids: waiting, t: group.t });
+    if (waiting.length > 0 && now - group.t <= CAPTION_WAIT_MINUTES * 60000) {
+      var rest = { c: group.c, s: group.s, ids: waiting, t: group.t };
+      if (group.r) rest.r = group.r;
+      left.push(rest);
+    }
   });
   props.setProperty('CAPS', JSON.stringify(left));
   return ready;
@@ -443,7 +497,8 @@ function takeCaptions_(props, done, now) {
 function writeCaptions_(ctx, captions) {
   captions.forEach(function (caption) {
     try {
-      writeCaption_(ctx, caption.s, caption.e, caption.c);
+      if (!caption.r) writeCaption_(ctx, caption.s, caption.e, caption.c);
+      else if (typeof receiptCaption_ === 'function') receiptCaption_(ctx, caption.e, caption.c); // 8個め: 経費の表の行に入れる
     } catch (err) {
       console.log('一言を表に書けませんでした: ' + (err && err.message));
     }
@@ -579,6 +634,13 @@ function drainPhotos() {
     stopped = err;
     console.log('手書きすいこみ口で止まりました: ' + (err && err.message)); // 番号と理由の名前だけ（読んだ文・鍵は入らない）
   }
+  // 8個め（レシートすいこみ口）も同じ: 止まっても、4個めと次の片付けの用意は済ませてから止まる
+  try {
+    readReceipts_(props, started);
+  } catch (err) {
+    stopped = stopped || err;
+    console.log('レシートすいこみ口で止まりました: ' + (err && err.message)); // 番号と理由の名前だけ（読んだ値・鍵は入らない）
+  }
   readReports_(props);
   // 仕事が残っていれば（止まって戻した写真・しまい終わるのを待っている一言）保険の片付けをそのまま残し、無ければ外す
   if (lock.tryLock(LOCK_MS)) {
@@ -594,15 +656,28 @@ function drainPhotos() {
 
 // ===== 片付けを起こす（1回だけ動く自動実行） =====
 
-// 片付けの仕事が残っているか（しまう前の写真・表に書く前の件数・表に書く前の一言・4個めに読ませる日報・6個めに読ませる手書きの写真）
+// 片付けの仕事が残っているか（しまう前の写真・表に書く前の件数・表に書く前の一言・4個めに読ませる日報・6個めに読ませる手書きの写真・
+// 8個めに読ませるレシートの写真）
 function pendingWork_(props) {
   return (
     listProp_(props, 'QUEUE').length > 0 ||
     (props.getProperty('NOTES') || '{}') !== '{}' ||
     listProp_(props, 'CAPS').length > 0 ||
     props.getProperty(HOGUSHI_PENDING) === '1' ||
-    listProp_(props, TEGAKI_QUEUE).length > 0
+    listProp_(props, TEGAKI_QUEUE).length > 0 ||
+    listProp_(props, RYOSHU_QUEUE).length > 0
   );
+}
+
+// 8個め（レシートすいこみ口）に読ませる写真があれば、読ませる。8個めのファイルが無ければ控えを外す（片付けを起こし続けないため。行は「読み取り待ち」のまま）
+function readReceipts_(props, started) {
+  if (listProp_(props, RYOSHU_QUEUE).length === 0) return;
+  if (typeof ryoshu_ !== 'function') {
+    props.deleteProperty(RYOSHU_QUEUE);
+    console.log('レシートすいこみ口（Ryoshu.gs）が無いので、読む控えを外しました');
+    return;
+  }
+  ryoshu_(props, started);
 }
 
 // 6個め（手書きすいこみ口）に読ませる写真があれば、読ませる。6個めのファイルが無ければ控えを外す（片付けを起こし続けないため。行は「読み取り待ち」のまま）
@@ -616,19 +691,20 @@ function readHandwriting_(props, started) {
   tegaki_(props, started);
 }
 
-// 6個めに読ませる手書きの写真を控えに足す（順番待ちの中で、いまの控えを読み直してから書く）。足せなければ false
-function addHand_(props, eventId, fileId) {
+// AI に読ませる写真を、読む控え（6個めは TEGAKI_QUEUE・8個めは RYOSHU_QUEUE）に足す（順番待ちの中で、いまの控えを読み直してから書く）。
+// 足せなければ false
+function queueForReading_(props, name, max, eventId, fileId) {
   var lock = LockService.getScriptLock();
   if (!lock.tryLock(LOCK_MS * 3)) return false;
   try {
-    var hands = listProp_(props, TEGAKI_QUEUE);
-    var known = hands.some(function (hand) {
-      return hand.e === eventId;
+    var items = listProp_(props, name);
+    var known = items.some(function (item) {
+      return item.e === eventId;
     });
     if (known) return true; // 止まってしまい直したときの2回目
-    if (hands.length >= TEGAKI_QUEUE_MAX + QUEUE_MAX) return false; // 受け付けで断っているので、ふつうは来ない
-    hands.push({ e: eventId, f: fileId });
-    props.setProperty(TEGAKI_QUEUE, JSON.stringify(hands));
+    if (items.length >= max + QUEUE_MAX) return false; // 受け付けで断っているので、ふつうは来ない
+    items.push({ e: eventId, f: fileId });
+    props.setProperty(name, JSON.stringify(items));
     return true;
   } finally {
     lock.releaseLock();
@@ -693,14 +769,16 @@ function deleteWakes_() {
 // 控えた写真を1枚しまう。'stored'（しまった）・'stored-no-ledger'（しまったが、台帳に足せなかった）・
 // 'unreadable'（LINEから取り出せない）・'already'（もうしまってある）
 function storePhoto_(ctx, item) {
+  // 8個め: レシートは、経費の表（日報とは別のファイル）と領収書のフォルダに（Ryoshu.gs）。ファイルが無ければ、ふつうの写真としてしまう（写真を失わない）
+  if (item.k === 2 && typeof storeReceipt_ === 'function') return storeReceipt_(ctx, item);
   var sheet = reportSheet_(book_(ctx));
   if (already_(sheet, item.e)) return 'already';
   var file = savePhoto_(ctx, item);
   if (!file) return 'unreadable';
-  if (item.k) {
+  if (item.k === 1) {
     // 6個め: 手書きの日報は「手書き」の行（内容は AI が読むまで「読み取り待ち」）。台帳には貼らない（工事写真ではないため）。
     // 読む控えに先に足してから行を入れる（行を入れたあとに止まっても、読み取り待ちのまま残らない）。足せなければ、人が写真を見る印
-    var queued = addHand_(ctx.props, item.e, file.getId());
+    var queued = queueForReading_(ctx.props, TEGAKI_QUEUE, TEGAKI_QUEUE_MAX, item.e, file.getId());
     sheet.appendRow([stamp_(item.t, 'yyyy/MM/dd HH:mm'), item.s, TEGAKI_KIND, queued ? TEGAKI_WAITING : TEGAKI_FAILED, file.getUrl(), item.e]);
     return 'stored';
   }
@@ -796,8 +874,8 @@ function ledgerSheet_(ss, site) {
   return sheet;
 }
 
-// LINEから写真の中身を取り出せたときだけ、現場のフォルダにしまう（作り話の番号では取り出せない）
-function savePhoto_(ctx, item) {
+// LINEから写真の中身を取り出せたときだけ、フォルダ（渡さなければ現場のフォルダ）にしまう（作り話の番号では取り出せない）
+function savePhoto_(ctx, item, folder) {
   if (item.p !== 'line') return null;
   var res = UrlFetchApp.fetch(API_DATA + '/message/' + encodeURIComponent(item.m) + '/content', {
     headers: { Authorization: 'Bearer ' + ctx.token },
@@ -805,7 +883,7 @@ function savePhoto_(ctx, item) {
   });
   if (res.getResponseCode() !== 200) return null;
   var blob = res.getBlob().setName(stamp_(item.t, 'yyyyMMdd_HHmmss') + '_' + item.s + '_' + item.n + '.jpg');
-  return siteFolder_(ctx.props, item.s).createFile(blob);
+  return (folder || siteFolder_(ctx.props, item.s)).createFile(blob);
 }
 
 // まとめて送った写真が、全部控えにそろったときに1回だけ true
@@ -1008,12 +1086,25 @@ function chooser_(text) {
   };
 }
 
-// 6個め: 「手書き」のボタン（クイックリプライ）つきの返事。押すと「手書き」の文が送られる
-function handButton_(text) {
+// 現場を選んだときの返事。6個め・8個めを入れていれば、「手書き」「領収書」のボタンも付ける
+function siteReply_(site, hand, receipt) {
+  var text = site + 'で受け付けます。日報や写真をどうぞ。';
+  if (hand && receipt) return kindButtons_(text + '紙の日報は「' + TEGAKI_KIND + '」、レシートは「' + RYOSHU_KIND + '」を押してから写真を送ってください。', [TEGAKI_KIND, RYOSHU_KIND]);
+  if (hand) return kindButtons_(text + '紙の日報は「' + TEGAKI_KIND + '」を押してから写真を送ってください。', [TEGAKI_KIND]);
+  if (receipt) return kindButtons_(text + 'レシートは「' + RYOSHU_KIND + '」を押してから写真を送ってください。', [RYOSHU_KIND]);
+  return textMsg_(text);
+}
+
+// 「手書き」「領収書」のボタン（クイックリプライ）つきの返事。押すと、その字の文が送られる
+function kindButtons_(text, kinds) {
   return {
     type: 'text',
     text: text,
-    quickReply: { items: [{ type: 'action', action: { type: 'message', label: TEGAKI_KIND, text: TEGAKI_KIND } }] },
+    quickReply: {
+      items: kinds.map(function (kind) {
+        return { type: 'action', action: { type: 'message', label: kind, text: kind } };
+      }),
+    },
   };
 }
 
